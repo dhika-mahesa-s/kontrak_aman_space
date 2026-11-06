@@ -1,15 +1,16 @@
-"""Kontrak Aman - Employment Contract Risk Checker for Fresh Graduates.
+"""Kontrak Aman - Employment Contract Risk Checker for Fresh Graduates (Streamlit).
 
 Pipeline: file ingestion -> structured clause extraction -> parser
--> risk-analysis LLM -> report. Ported from the Langflow flow.
+-> risk-analysis LLM -> report.
 """
+import io
 import json
 import os
 import threading
 from datetime import date
 from pathlib import Path
 
-import gradio as gr
+import streamlit as st
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -76,23 +77,19 @@ class ContractClauses(BaseModel):
 
 
 # ---------- Stage 1: file ingestion ----------
-def read_contract(file_path, pasted_text):
-    if pasted_text and pasted_text.strip():
-        return pasted_text.strip()
-    if not file_path:
-        raise ValueError("Unggah file kontrak atau tempel teksnya terlebih dahulu.")
-    path = Path(file_path)
-    ext = path.suffix.lower()
-    if ext == ".pdf":
+def read_uploaded(uploaded):
+    name = uploaded.name.lower()
+    data = uploaded.getvalue()
+    if name.endswith(".pdf"):
         from pypdf import PdfReader
-        text = "\n".join((p.extract_text() or "") for p in PdfReader(str(path)).pages)
+        text = "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(data)).pages)
         if not text.strip():
             raise ValueError("PDF tidak berisi teks (kemungkinan hasil scan). Gunakan PDF/DOCX berbasis teks.")
-    elif ext == ".docx":
+    elif name.endswith(".docx"):
         from docx import Document
-        text = "\n".join(p.text for p in Document(str(path)).paragraphs)
-    elif ext in (".txt", ".md"):
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        text = "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
+    elif name.endswith((".txt", ".md")):
+        text = data.decode("utf-8", errors="ignore")
     else:
         raise ValueError("Format tidak didukung. Gunakan PDF, DOCX, atau TXT.")
     if not text.strip():
@@ -101,22 +98,27 @@ def read_contract(file_path, pasted_text):
 
 
 # ---------- Rate limiting (protects the free API quota) ----------
-_lock = threading.Lock()
-_usage = {"day": date.today(), "count": 0}
+@st.cache_resource
+def _usage():
+    return {"lock": threading.Lock(), "day": date.today(), "count": 0}
 
 
 def check_quota():
-    with _lock:
+    u = _usage()
+    with u["lock"]:
         today = date.today()
-        if _usage["day"] != today:
-            _usage.update(day=today, count=0)
-        if _usage["count"] >= DAILY_LIMIT:
+        if u["day"] != today:
+            u["day"], u["count"] = today, 0
+        if u["count"] >= DAILY_LIMIT:
             raise RuntimeError("Kuota demo harian sudah habis. Silakan coba lagi besok.")
-        _usage["count"] += 1
+        u["count"] += 1
 
 
 def get_client():
-    key = os.getenv("GOOGLE_API_KEY")
+    try:
+        key = st.secrets["GOOGLE_API_KEY"]
+    except Exception:
+        key = os.getenv("GOOGLE_API_KEY")
     if not key:
         raise RuntimeError("GOOGLE_API_KEY belum diatur di Secrets.")
     return genai.Client(api_key=key)
@@ -155,54 +157,63 @@ def analyze_risk(client, clauses_str):
     return resp.text
 
 
-# ---------- Stage 5: chat/report output (Gradio) ----------
-def run_pipeline(file_path, pasted_text):
-    try:
-        yield "⏳ Tahap 1/4: membaca kontrak...", ""
-        text = read_contract(file_path, pasted_text)
-        if len(text) > MAX_CHARS:
-            raise ValueError(f"Kontrak terlalu panjang (maks {MAX_CHARS:,} karakter untuk demo).")
-        check_quota()
-        client = get_client()
+# ---------- Stage 5: UI ----------
+def main():
+    st.set_page_config(page_title="Kontrak Aman", page_icon="📄", layout="wide")
+    st.title("📄 Kontrak Aman")
+    st.caption("Pemeriksa risiko kontrak kerja untuk fresh graduate.")
+    st.warning(
+        "**Bukan nasihat hukum.** Alat ini hanya memberi gambaran umum. "
+        "Jangan unggah kontrak asli yang berisi data pribadi; gunakan contoh fiktif atau hapus identitas terlebih dahulu."
+    )
 
-        yield "⏳ Tahap 2/4: mengekstrak klausul...", ""
-        clauses = extract_clauses(client, text)
+    if "contract_text" not in st.session_state:
+        st.session_state.contract_text = ""
 
-        yield "⏳ Tahap 3/4: menyusun data klausul...", ""
-        clauses_str = parse_clauses(clauses)
+    left, right = st.columns(2)
+    with left:
+        uploaded = st.file_uploader("Unggah kontrak (PDF/DOCX/TXT)", type=["pdf", "docx", "txt"])
+        if st.button("Pakai contoh kontrak fiktif"):
+            st.session_state.contract_text = SAMPLE_PATH.read_text(encoding="utf-8")
+        st.text_area("Atau tempel teks kontrak", height=300, key="contract_text")
+        run = st.button("Analisis kontrak", type="primary")
 
-        yield "⏳ Tahap 4/4: menganalisis risiko...", clauses_str
-        report = analyze_risk(client, clauses_str)
-        yield report, clauses_str
-    except Exception as e:  # show friendly error in the UI
-        yield f"⚠️ {e}", ""
+    with right:
+        if not run:
+            st.info("Hasil analisis akan tampil di sini.")
+            return
+        try:
+            with st.status("Menganalisis kontrak...", expanded=True) as status:
+                st.write("Tahap 1/4: membaca kontrak")
+                pasted = st.session_state.contract_text.strip()
+                if pasted:
+                    text = pasted
+                elif uploaded is not None:
+                    text = read_uploaded(uploaded)
+                else:
+                    raise ValueError("Unggah file kontrak atau tempel teksnya terlebih dahulu.")
+                if len(text) > MAX_CHARS:
+                    raise ValueError(f"Kontrak terlalu panjang (maks {MAX_CHARS:,} karakter untuk demo).")
+                check_quota()
+                client = get_client()
 
+                st.write("Tahap 2/4: mengekstrak klausul")
+                clauses = extract_clauses(client, text)
 
-def load_sample():
-    return SAMPLE_PATH.read_text(encoding="utf-8")
+                st.write("Tahap 3/4: menyusun data klausul")
+                clauses_str = parse_clauses(clauses)
 
+                st.write("Tahap 4/4: menganalisis risiko")
+                report = analyze_risk(client, clauses_str)
+                status.update(label="Selesai", state="complete", expanded=False)
+        except Exception as e:
+            st.error(str(e))
+            return
 
-DISCLAIMER = (
-    "**Bukan nasihat hukum.** Alat ini hanya memberi gambaran umum. "
-    "Jangan unggah kontrak asli yang berisi data pribadi; gunakan contoh fiktif atau hapus identitas terlebih dahulu."
-)
+        st.markdown(report)
+        with st.expander("Klausul hasil ekstraksi (JSON)"):
+            st.code(clauses_str, language="json")
 
-with gr.Blocks(title="Kontrak Aman") as demo:
-    gr.Markdown("# 📄 Kontrak Aman\nPemeriksa risiko kontrak kerja untuk fresh graduate.")
-    gr.Markdown(DISCLAIMER)
-    with gr.Row():
-        with gr.Column():
-            file_in = gr.File(label="Unggah kontrak (PDF/DOCX/TXT)", file_types=[".pdf", ".docx", ".txt"], type="filepath")
-            text_in = gr.Textbox(label="Atau tempel teks kontrak", lines=10)
-            with gr.Row():
-                sample_btn = gr.Button("Pakai contoh kontrak fiktif")
-                run_btn = gr.Button("Analisis kontrak", variant="primary")
-        with gr.Column():
-            report_out = gr.Markdown(label="Hasil analisis")
-            with gr.Accordion("Klausul hasil ekstraksi (JSON)", open=False):
-                json_out = gr.Code(language="json", label="Structured output")
-    sample_btn.click(load_sample, outputs=text_in)
-    run_btn.click(run_pipeline, inputs=[file_in, text_in], outputs=[report_out, json_out])
 
 if __name__ == "__main__":
-    demo.queue(max_size=10).launch()
+    main()
